@@ -1,10 +1,3 @@
---[[ 
-    Huge Notifier (External Config Version)
-    ---------------------------------------
-    - Reads settings from `getgenv().Config`
-    - Uses loadstring() to fetch updates from GitHub
-    - Keeps the main script separate from configurations
-]]
 
 -- Services & Modules
 local Players = game:GetService("Players")
@@ -13,7 +6,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 repeat task.wait() until game:IsLoaded()
-repeat task.wait() until not LocalPlayer.PlayerGui:FindFirstChild('__INTRO')
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+repeat task.wait() until not PlayerGui:FindFirstChild("__INTRO")
 
 local Library = ReplicatedStorage:FindFirstChild("Library")
 if not Library then
@@ -28,21 +22,48 @@ if not Client then
 end
 
 -- Require Modules
-local ExistCmds = require(Client.ExistCountCmds)
-local RapCmds = require(Client.DevRAPCmds)
+local function FindCmdModule(names)
+    for _, name in ipairs(names) do
+        local mod = Client:FindFirstChild(name)
+        if mod then
+            return mod
+        end
+    end
+    return nil
+end
+
+local ExistModule = FindCmdModule({"ExistCountCmds", "ExistCmds"})
+local RapModule = FindCmdModule({"DevRAPCmds", "RAPCmds", "RapCmds"})
+
+if not ExistModule then
+    warn("[ERROR] Missing ExistCountCmds module in Client.")
+    return
+end
+
+local ExistCmds = require(ExistModule)
+local RapCmds = RapModule and require(RapModule) or nil
 local Network = require(Client.Network)
 local SaveMod = require(Client.Save)
 
 -- Load Config from getgenv()
 local Config = getgenv().Config or {}
+local Notifications = type(Config.Notifications) == "table" and Config.Notifications or {}
+local IdNames = Notifications["Id Names"] or {"Huge", "Titanic"}
 
-local WebhookID = Config["Notifications"] and Config["Notifications"]["UserID"] or "DEFAULT_USER_ID"
-local WebhookURL = Config["Notifications"] and Config["Notifications"]["Webhook"] or "DEFAULT_WEBHOOK_URL"
-local EmbedColor = Config["Notifications"] and Config["Notifications"]["EmbedColor"] or 0x1E3A5F -- Default to Dark Blue
+local WebhookID = Notifications.UserID or "DEFAULT_USER_ID"
+local WebhookURL = Notifications.Webhook or "DEFAULT_WEBHOOK_URL"
+local EmbedColor = Notifications.EmbedColor or 0x1E3A5F -- Default to Dark Blue
+
+if getgenv().HugeNotifierRunning then
+    warn("[WARN] Huge Notifier is already running.")
+    return
+end
+getgenv().HugeNotifierRunning = true
 
 -- Webhook Rate Limiting System
 local recentWebhookCount = 0
 local lastWebhookTime = os.time()
+local SentPets = {}
 
 -----------------------------------------------------
 -- Utility Functions
@@ -73,30 +94,59 @@ local function GetImageUrl(petData)
 end
 
 -- Fetch RAP & Exist values
+local DisabledCmds = {}
 local function GetStats(Cmds, petData)
-    return Cmds.Get({
-        Class = { Name = "Pet" },
-        IsA = function(InputClass) return InputClass == "Pet" end,
-        GetId = function() return petData.id end,
-        StackKey = function()
-            return HttpService:JSONEncode({
-                id = petData.id,
-                sh = petData.sh,
-                pt = petData.pt,
-                tn = petData.tn
-            })
-        end
-    }) or 0
+    if not Cmds or not Cmds.Get or DisabledCmds[Cmds] then
+        return 0
+    end
+    local ok, value = pcall(function()
+        local payload = {
+            Class = { Name = "Pet" },
+            IsA = function(InputClass) return InputClass == "Pet" end,
+            GetId = function() return petData.id end,
+            StackKey = function()
+                return HttpService:JSONEncode({
+                    id = petData.id,
+                    sh = petData.sh,
+                    pt = petData.pt,
+                    tn = petData.tn
+                })
+            end,
+            AbstractGetRAP = function()
+                return nil, nil
+            end,
+            GetDefaultRAP = function()
+                return 0
+            end
+        }
+        return Cmds.Get(payload)
+    end)
+    if not ok then
+        DisabledCmds[Cmds] = true
+        warn("[WARN] Cmds.Get failed; disabling this module:", value)
+        return 0
+    end
+    return value or 0
 end
 
 -----------------------------------------------------
 -- Webhook Notification (Uses Configurable Settings)
 -----------------------------------------------------
-local function SendWebhook(Id, pt, sh)
+local requestFunc = (syn and syn.request) or (http and http.request) or http_request or request
+local function SendWebhook(Id, pt, sh, petUid)
     -- Check rate limit
     local currentTime = os.time()
     if recentWebhookCount >= 3 and currentTime - lastWebhookTime < 2 then
         task.wait(2) -- Apply cooldown if sending too many at once
+    end
+
+    if petUid and SentPets[petUid] then
+        return
+    end
+
+    if not requestFunc then
+        warn("[ERROR] No HTTP request function available in this executor.")
+        return
     end
 
     local Img = GetImageUrl({ id = Id, pt = pt })
@@ -122,7 +172,7 @@ local function SendWebhook(Id, pt, sh)
     })
     
     local success, err = pcall(function()
-        return request({
+        return requestFunc({
             Url = WebhookURL,
             Method = "POST",
             Headers = { ["Content-Type"] = "application/json" },
@@ -136,6 +186,9 @@ local function SendWebhook(Id, pt, sh)
         print("[DEBUG] Webhook sent for", Id)
         recentWebhookCount = recentWebhookCount + 1
         lastWebhookTime = os.time()
+        if petUid then
+            SentPets[petUid] = true
+        end
     end
 end
 
@@ -150,11 +203,10 @@ local function InitializeTracking()
 
     local inventory = SaveMod.Get().Inventory.Pet
     for PetUID, petData in pairs(inventory) do
-        for _, searchName in pairs(Config["Notifications"]["Id Names"] or {"Huge", "Titanic"}) do
-            if petData.id:find(searchName) then
+        for _, searchName in pairs(IdNames) do
+            if petData.id and petData.id:find(searchName) then
                 TrackedPets[PetUID] = true
-                print("[DEBUG] Already owned:", petData.id)
-                SendWebhook(petData.id, petData.pt, petData.sh) -- Send webhook for existing pets
+                print("[DEBUG] Already owned (tracking only):", petData.id)
             end
         end
     end
@@ -164,11 +216,11 @@ end
 Network.Fired('Items: Update'):Connect(function(Player, Inv)
     if Inv['set'] and Inv['set']['Pet'] then
         for PetUID, petData in pairs(Inv['set']['Pet']) do
-            for _, searchName in pairs(Config["Notifications"]["Id Names"] or {"Huge", "Titanic"}) do
-                if petData.id:find(searchName) and not TrackedPets[PetUID] then
+            for _, searchName in pairs(IdNames) do
+                if petData.id and petData.id:find(searchName) and not TrackedPets[PetUID] then
                     TrackedPets[PetUID] = true
                     print("[DEBUG] New Huge/Titanic detected:", petData.id)
-                    SendWebhook(petData.id, petData.pt, petData.sh)
+                    SendWebhook(petData.id, petData.pt, petData.sh, PetUID)
                 end
             end
         end
